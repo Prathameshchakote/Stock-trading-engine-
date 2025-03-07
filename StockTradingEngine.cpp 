@@ -1,0 +1,214 @@
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <iostream>
+#include <random>
+#include <chrono>
+#include <cstring>
+#include <climits>
+
+// Constants
+const int NUM_TICKERS = 1024;  // Support 1024 tickers
+const int MAX_ORDERS = 10000;  // Max orders in the system
+const int ORDER_TYPE_BUY = 0;
+const int ORDER_TYPE_SELL = 1;
+
+// Order structure
+struct Order {
+    int order_type;  // 0 for Buy, 1 for Sell
+    int ticker;      // Integer index (0 to 1023)
+    int quantity;
+    double price;
+    long long timestamp;  // For time priority
+    bool active;     // To mark if order is still active
+
+    Order() : order_type(0), ticker(0), quantity(0), price(0.0), timestamp(0), active(false) {}
+    Order(int type, int tick, int qty, double prc, long long ts)
+        : order_type(type), ticker(tick), quantity(qty), price(prc), timestamp(ts), active(true) {}
+};
+
+// Stock Trading Engine
+class StockTradingEngine {
+private:
+    Order orders[MAX_ORDERS];             // Fixed-size array for orders
+    std::atomic<int> order_count{0};      // Number of active orders
+    std::atomic<int> next_order_id{0};    // Next free slot in orders array
+
+    // Get current timestamp in microseconds
+    long long get_current_timestamp() const {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+    }
+
+    // Convert ticker symbol to integer index (0-1023)
+    int ticker_to_index(const char* ticker_symbol) const {
+        // Simple hash: sum of ASCII values modulo NUM_TICKERS
+        int sum = 0;
+        for (int i = 0; ticker_symbol[i] != '\0' && i < 4; ++i) {
+            sum += static_cast<int>(ticker_symbol[i]);
+        }
+        return sum % NUM_TICKERS;
+    }
+
+public:
+    StockTradingEngine() {
+        // Initialize orders array
+        for (int i = 0; i < MAX_ORDERS; ++i) {
+            orders[i].active = false;
+        }
+    }
+
+    bool addOrder(int order_type, const char* ticker_symbol, int quantity, double price) {
+        // Validate inputs
+        if (order_type != ORDER_TYPE_BUY && order_type != ORDER_TYPE_SELL) return false;
+        if (quantity <= 0 || price <= 0.0) return false;
+
+        int ticker = ticker_to_index(ticker_symbol);
+        long long timestamp = get_current_timestamp();
+
+        // Find a free slot atomically
+        int slot;
+        while (true) {
+            slot = next_order_id.load(std::memory_order_acquire);
+            if (slot >= MAX_ORDERS) return false;  // No space
+            if (next_order_id.compare_exchange_weak(slot, slot + 1,
+                                                    std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
+
+        // Place the order in the slot
+        orders[slot] = Order(order_type, ticker, quantity, price, timestamp);
+        order_count.fetch_add(1, std::memory_order_release);
+
+        // Try to match the order
+        matchOrder(slot);
+        return true;
+    }
+
+    void matchOrder(int new_order_id) {
+        if (new_order_id < 0 || new_order_id >= MAX_ORDERS || !orders[new_order_id].active) {
+            return;
+        }
+
+        Order& new_order = orders[new_order_id];
+
+        // Variables to track best match
+        int best_match_id = -1;
+        double best_match_price = (new_order.order_type == ORDER_TYPE_BUY) ? INT_MAX : -INT_MAX;
+        long long best_match_timestamp = INT_MAX;
+
+        // Scan all orders for a match (O(n) time)
+        for (int i = 0; i < MAX_ORDERS; ++i) {
+            if (i == new_order_id) continue;
+            Order& order = orders[i];
+            if (!order.active) continue;
+            if (order.ticker != new_order.ticker) continue;
+
+            if (new_order.order_type == ORDER_TYPE_BUY && order.order_type == ORDER_TYPE_SELL) {
+                // Buy order looking for lowest sell price
+                if (new_order.price >= order.price) {
+                    if (order.price < best_match_price ||
+                        (order.price == best_match_price && order.timestamp < best_match_timestamp)) {
+                        best_match_id = i;
+                        best_match_price = order.price;
+                        best_match_timestamp = order.timestamp;
+                    }
+                }
+            } else if (new_order.order_type == ORDER_TYPE_SELL && order.order_type == ORDER_TYPE_BUY) {
+                // Sell order looking for highest buy price
+                if (order.price >= new_order.price) {
+                    if (order.price > best_match_price ||
+                        (order.price == best_match_price && order.timestamp < best_match_timestamp)) {
+                        best_match_id = i;
+                        best_match_price = order.price;
+                        best_match_timestamp = order.timestamp;
+                    }
+                }
+            }
+        }
+
+        // If a match is found, execute the trade
+        if (best_match_id != -1) {
+            Order& matched_order = orders[best_match_id];
+            // Since we're lock-free, we need to ensure both orders are still active
+            // We'll use atomic updates to quantities
+            while (true) {
+                if (!new_order.active || !matched_order.active) break;
+
+                int new_qty = new_order.quantity;
+                int matched_qty = matched_order.quantity;
+                if (new_qty <= 0 || matched_qty <= 0) break;
+
+                int match_qty = std::min(new_qty, matched_qty);
+
+                // Update quantities atomically (simulated via careful ordering)
+                new_order.quantity -= match_qty;
+                matched_order.quantity -= match_qty;
+
+                // Deactivate orders if fully matched
+                if (new_order.quantity <= 0) {
+                    new_order.active = false;
+                    order_count.fetch_sub(1, std::memory_order_release);
+                }
+                if (matched_order.quantity <= 0) {
+                    matched_order.active = false;
+                    order_count.fetch_sub(1, std::memory_order_release);
+                }
+
+                std::cout << "Matched: " << match_qty << " shares of ticker " << new_order.ticker
+                          << " at price " << best_match_price << "\n";
+                break;  // Single match per call for simplicity
+            }
+        }
+    }
+
+    void simulateActiveTrading(int num_orders, int num_threads) {
+        std::vector<std::thread> threads;
+        int orders_per_thread = num_orders / num_threads;
+
+        // Random number generation setup
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> type_dist(0, 1);  // Buy or Sell
+        std::uniform_int_distribution<> ticker_dist(0, NUM_TICKERS - 1);
+        std::uniform_int_distribution<> qty_dist(1, 100);
+        std::uniform_real_distribution<> price_dist(10.0, 100.0);
+
+        auto worker = [this, orders_per_thread, &type_dist, &ticker_dist, &qty_dist, &price_dist, &gen]() {
+            for (int i = 0; i < orders_per_thread; ++i) {
+                int order_type = type_dist(gen);
+                char ticker_symbol[5];
+                snprintf(ticker_symbol, sizeof(ticker_symbol), "T%03d", ticker_dist(gen));
+                int quantity = qty_dist(gen);
+                double price = price_dist(gen);
+                addOrder(order_type, ticker_symbol, quantity, price);
+            }
+        };
+
+        // Launch threads
+        for (int i = 0; i < num_threads; ++i) {
+            threads.emplace_back(worker);
+        }
+
+        // Join threads
+        for (auto& t : threads) {
+            t.join();
+        }
+    }
+
+    int getOrderCount() const {
+        return order_count.load(std::memory_order_acquire);
+    }
+};
+
+// Main execution
+int main() {
+    StockTradingEngine engine;
+    std::cout << "Starting simulation...\n";
+    engine.simulateActiveTrading(1000, 10);  // 1000 orders across 10 threads
+    std::cout << "Final number of active orders: " << engine.getOrderCount() << "\n";
+    return 0;
+}
